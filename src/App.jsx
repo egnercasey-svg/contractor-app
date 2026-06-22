@@ -196,38 +196,134 @@ Format clearly with headers and bullet points. Be specific and practical.`;
 // ── Tab 2: Estimate Comparison ───────────────────────────────────────────────
 function EstimateTab() {
   const [project, setProject] = useState("");
-  const [estimates, setEstimates] = useState([{ name: "", total: "", notes: "" }, { name: "", total: "", notes: "" }]);
+  const [estimates, setEstimates] = useState([{ name: "", total: "", notes: "", file: null, fileData: null, fileName: null, fileType: null }, { name: "", total: "", notes: "", file: null, fileData: null, fileName: null, fileType: null }]);
   const [result, setResult] = useState("");
   const [loading, setLoading] = useState(false);
+  const [extracting, setExtracting] = useState({});
 
   const updateEst = (i, k, v) => setEstimates(e => e.map((est, idx) => idx === i ? { ...est, [k]: v } : est));
+
+  async function handleFile(i, file) {
+    if (!file) return;
+    setExtracting(ex => ({ ...ex, [i]: true }));
+    try {
+      const reader = new FileReader();
+      reader.onload = async (e) => {
+        const base64 = e.target.result.split(",")[1];
+        const fileType = file.type;
+        const fileName = file.name;
+        updateEst(i, "fileName", fileName);
+        updateEst(i, "fileType", fileType);
+        updateEst(i, "fileData", base64);
+
+        // Ask Claude to extract key details from the file
+        const isImage = fileType.startsWith("image/");
+        const body = {
+          model: ANTHROPIC_MODEL,
+          max_tokens: 1000,
+          messages: [{
+            role: "user",
+            content: [
+              isImage
+                ? { type: "image", source: { type: "base64", media_type: fileType, data: base64 } }
+                : { type: "document", source: { type: "base64", media_type: "application/pdf", data: base64 } },
+              { type: "text", text: `Extract the key details from this contractor estimate. Return ONLY a JSON object with these fields:
+{
+  "contractorName": "company name or empty string",
+  "totalAmount": "total price as number only, no $ sign",
+  "scopeOfWork": "brief summary of what's included",
+  "exclusions": "what's explicitly excluded or empty string",
+  "timeline": "project timeline or empty string",
+  "paymentTerms": "payment schedule or empty string"
+}
+Return only valid JSON, no other text.` }
+            ]
+          }]
+        };
+
+        const res = await fetch("/.netlify/functions/claude", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json();
+        const text = data.content.filter(b => b.type === "text").map(b => b.text).join("");
+        try {
+          const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+          if (parsed.contractorName) updateEst(i, "name", parsed.contractorName);
+          if (parsed.totalAmount) updateEst(i, "total", parsed.totalAmount);
+          if (parsed.scopeOfWork) updateEst(i, "notes", `Scope: ${parsed.scopeOfWork}${parsed.exclusions ? `\nExclusions: ${parsed.exclusions}` : ""}${parsed.timeline ? `\nTimeline: ${parsed.timeline}` : ""}${parsed.paymentTerms ? `\nPayment: ${parsed.paymentTerms}` : ""}`);
+        } catch {}
+        setExtracting(ex => ({ ...ex, [i]: false }));
+      };
+      reader.readAsDataURL(file);
+    } catch {
+      setExtracting(ex => ({ ...ex, [i]: false }));
+    }
+  }
 
   async function compare() {
     setLoading(true); setResult("");
     try {
-      const estList = estimates.filter(e => e.name && e.total)
-        .map((e, i) => `Contractor ${i + 1}: ${e.name} — $${e.total}${e.notes ? ` (notes: ${e.notes})` : ""}`).join("\n");
+      // Fetch historical estimates from Supabase for context
+      let historicalContext = "";
+      try {
+        const res = await fetch("/.netlify/functions/upload-estimates");
+        const historical = await res.json();
+        if (Array.isArray(historical) && historical.length > 0) {
+          const relevant = historical.filter(h => !project || h.project_type?.toLowerCase().includes(project.toLowerCase())).slice(0, 10);
+          if (relevant.length > 0) {
+            historicalContext = `\n\nFor additional context, here are ${relevant.length} similar estimates previously submitted by other users:\n` +
+              relevant.map(h => `- ${h.contractor_name || "Unknown"}: $${h.total_amount?.toLocaleString()} for ${h.project_type} (${h.region || "unknown location"}) — ${h.scope_summary || ""}`).join("\n");
+          }
+        }
+      } catch {}
+
+      const estList = estimates.filter(e => e.name || e.total)
+        .map((e, i) => `Contractor ${i + 1}: ${e.name || "Unknown"} — $${e.total || "unknown"}${e.notes ? `\nDetails: ${e.notes}` : ""}`).join("\n\n");
+
       const prompt = `You are a construction industry expert helping a homeowner compare contractor estimates.
-Project: ${project}
+Project: ${project || "Not specified"}
+
 Estimates received:
 ${estList}
+${historicalContext}
 
-Provide a detailed comparison analysis:
+Provide a detailed comparison:
 1. **Price spread analysis** — what the range tells them, which is suspiciously low or high
-2. **What might explain the differences** — scope variations, materials, labour rates
+2. **Scope comparison** — what each quote includes and critically what's missing or different
 3. **Recommended choice** — which estimate looks most reasonable and why
 4. **Questions to ask each contractor** — to verify their quote covers the same scope
 5. **Negotiation tips** — how to use competing quotes to their advantage
-6. **Red flags in the pricing** — anything that stands out
+6. **Red flags** — anything that stands out as concerning
+${historicalContext ? "7. **How these compare to historical data** — are these quotes in line with what others have paid?" : ""}
 
 Be direct and practical. Give a concrete recommendation.`;
+
+      // Save uploaded estimates to history
+      for (const est of estimates.filter(e => e.fileData && e.name && e.total)) {
+        try {
+          await fetch("/.netlify/functions/upload-estimates", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contractorName: est.name,
+              totalAmount: parseFloat(est.total.replace(/[,$]/g, "")),
+              projectType: project,
+              scopeSummary: est.notes,
+              fileName: est.fileName,
+            }),
+          });
+        } catch {}
+      }
+
       setResult(await askClaude(prompt));
     } catch { setResult("Error comparing estimates. Please try again."); }
     setLoading(false);
   }
 
   const readyEstimates = estimates.filter(e => e.name && e.total);
-  const amounts = readyEstimates.map(e => parseFloat(e.total.replace(/[,$]/g, ""))).filter(n => !isNaN(n));
+  const amounts = readyEstimates.map(e => parseFloat(String(e.total).replace(/[,$]/g, ""))).filter(n => !isNaN(n));
   const minAmt = amounts.length ? Math.min(...amounts) : null;
   const maxAmt = amounts.length ? Math.max(...amounts) : null;
 
@@ -239,23 +335,65 @@ Be direct and practical. Give a concrete recommendation.`;
         <input placeholder="e.g. Full bathroom renovation" value={project} onChange={e => setProject(e.target.value)} />
       </div>
       <div className="card">
-        <div className="card-title">Enter Estimates</div>
+        <div className="card-title">Upload or Enter Estimates</div>
+        <p style={{ fontSize: 13, color: T.steel, marginBottom: 16, lineHeight: 1.6 }}>
+          Upload PDFs or photos of your estimates and we'll read them automatically — or fill in the details manually.
+        </p>
         {estimates.map((est, i) => (
-          <div key={i} style={{ marginBottom: 16, paddingBottom: 16, borderBottom: i < estimates.length - 1 ? `1px solid ${T.navyLt}` : "none" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+          <div key={i} style={{ marginBottom: 20, paddingBottom: 20, borderBottom: i < estimates.length - 1 ? `1px solid ${T.navyLt}` : "none" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
               <span style={{ fontSize: 12, color: T.steel, fontFamily: "DM Mono, monospace" }}>CONTRACTOR {i + 1}</span>
               {estimates.length > 2 && <button className="btn btn-ghost btn-sm" onClick={() => setEstimates(e => e.filter((_, idx) => idx !== i))}>Remove</button>}
             </div>
+
+            {/* File upload area */}
+            <div
+              style={{
+                border: `2px dashed ${est.fileName ? T.ok : T.navyLt}`,
+                borderRadius: 6,
+                padding: "16px",
+                textAlign: "center",
+                marginBottom: 14,
+                background: est.fileName ? "rgba(82,183,136,0.06)" : T.navy,
+                cursor: "pointer",
+                transition: "border-color 0.15s",
+              }}
+              onClick={() => document.getElementById(`file-${i}`).click()}
+              onDragOver={e => e.preventDefault()}
+              onDrop={e => { e.preventDefault(); handleFile(i, e.dataTransfer.files[0]); }}
+            >
+              <input
+                id={`file-${i}`}
+                type="file"
+                accept=".pdf,image/*"
+                style={{ display: "none" }}
+                onChange={e => handleFile(i, e.target.files[0])}
+              />
+              {extracting[i] ? (
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, color: T.steel }}>
+                  <Spinner /> <span style={{ fontSize: 13 }}>Reading estimate…</span>
+                </div>
+              ) : est.fileName ? (
+                <div style={{ fontSize: 13, color: T.ok }}>✓ {est.fileName} — <span style={{ color: T.steel, cursor: "pointer" }} onClick={e => { e.stopPropagation(); updateEst(i, "fileName", null); updateEst(i, "fileData", null); }}>Remove</span></div>
+              ) : (
+                <div>
+                  <div style={{ fontSize: 24, marginBottom: 6 }}>📄</div>
+                  <div style={{ fontSize: 13, color: T.steel }}>Drop a PDF or photo here, or <span style={{ color: T.cyan }}>click to browse</span></div>
+                  <div style={{ fontSize: 11, color: T.cyanDim, marginTop: 4 }}>Details will be filled in automatically</div>
+                </div>
+              )}
+            </div>
+
             <div className="grid2">
               <div><label>Company Name</label><input placeholder="e.g. Smith & Sons Building" value={est.name} onChange={e => updateEst(i, "name", e.target.value)} /></div>
-              <div><label>Total Quote Amount</label><input placeholder="e.g. 18500" value={est.total} onChange={e => updateEst(i, "total", e.target.value)} /></div>
+              <div><label>Total Quote Amount ($)</label><input placeholder="e.g. 18500" value={est.total} onChange={e => updateEst(i, "total", e.target.value)} /></div>
             </div>
-            <label>Notes (what's included/excluded, timeline, etc.)</label>
+            <label>Notes / Scope (what's included, excluded, timeline)</label>
             <textarea style={{ minHeight: 60 }} placeholder="e.g. Includes tiles, excludes plumbing. 4 week timeline." value={est.notes} onChange={e => updateEst(i, "notes", e.target.value)} />
           </div>
         ))}
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-          <button className="btn btn-ghost" onClick={() => setEstimates(e => [...e, { name: "", total: "", notes: "" }])}>+ Add Another Estimate</button>
+          <button className="btn btn-ghost" onClick={() => setEstimates(e => [...e, { name: "", total: "", notes: "", file: null, fileData: null, fileName: null, fileType: null }])}>+ Add Another Estimate</button>
           <button className="btn" disabled={readyEstimates.length < 2 || !project || loading} onClick={compare}>
             {loading ? <><Spinner /> Analysing…</> : "Compare Estimates →"}
           </button>
@@ -268,7 +406,7 @@ Be direct and practical. Give a concrete recommendation.`;
             <thead><tr><th>Contractor</th><th>Quote</th><th>vs Lowest</th></tr></thead>
             <tbody>
               {readyEstimates.map((est, i) => {
-                const amt = parseFloat(est.total.replace(/[,$]/g, ""));
+                const amt = parseFloat(String(est.total).replace(/[,$]/g, ""));
                 const diff = isNaN(amt) ? null : ((amt - minAmt) / minAmt * 100).toFixed(0);
                 return (
                   <tr key={i}>
